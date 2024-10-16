@@ -1,7 +1,10 @@
+// Git repository available on GitHub at https://github.com/thedarkcolour/mips-assembler
+
+use std::ascii::AsciiExt;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use bimap::BiMap;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 // Offset I type instructions
 const LW_OPCODE: u32 = 0b100011;
@@ -19,8 +22,18 @@ const SRAV_OPCODE: u32 = 0b000111;
 struct Args {
     #[arg(short, long)]
     input_file: String,
-    #[arg(short, long, action)]
-    disassemble: bool,
+    #[arg(short, long)]
+    mode: Option<AssemblerMode>,
+}
+
+#[derive(Eq, PartialEq, Clone, ValueEnum)]
+enum AssemblerMode {
+    // Assemble .bin and .mhc files from Binary
+    Assemble,
+    // Disassemble .bin files
+    Bin,
+    // Disassemble .mhc files
+    Mhc,
 }
 
 fn main() {
@@ -30,15 +43,60 @@ fn main() {
     let registers = create_register_codes();
 
     let args = Args::parse();
+    let input_path = &args.input_file;
+    let mode = args.mode.unwrap_or(AssemblerMode::Assemble);
 
-    if args.disassemble {
-        println!("I am going to die");
-        //disassemble_file();
-    } else {
-        let input_path = &args.input_file;
+    if mode == AssemblerMode::Assemble {
         let binary_path = input_path.to_owned() + ".bin";
         let mhc_path = input_path.to_owned() + ".mhc";
+
         assemble_file(&j_codes, &i_codes, &r_codes, &registers, &binary_path, input_path, &mhc_path);
+    } else {
+        let mut input_file = File::create(input_path).expect("No such file");
+        let mut instructions: Vec<u32> = Vec::new();
+        let mut bytes: Vec<u8>;
+
+        // Different reading modes
+        if mode == AssemblerMode::Bin {
+            let mut input_file = std::io::BufReader::new(input_file);
+            let mut s = String::new();
+
+            bytes = input_file.read_to_string(&mut s)
+                .expect("Failed to read")
+                .to_le_bytes()
+                .to_vec();
+        } else {
+            // copied from std::fs::read
+            let size = input_file.metadata().map(|m| m.len() as usize).ok();
+            bytes = Vec::with_capacity(size.unwrap_or(0));
+            input_file.read_to_end(&mut bytes).unwrap();
+        }
+
+        instructions.reserve(bytes.len() / 4);
+        for chunk in bytes.chunks(4) {
+            // Rust wants things in sized slices apparently
+            let mut chunk_4 = [0u8; 4];
+            chunk_4.copy_from_slice(chunk);
+            instructions.push(u32::from_le_bytes(chunk_4));
+        }
+
+        for instruction in instructions {
+            let opcode = instruction >> 26;
+
+            let result = if opcode == 0 {
+                disassemble_r(instruction, &registers, *r_codes.get_by_right(&(instruction & 0b111111)).unwrap())
+            } else {
+                if let Some(j_instruction) = j_codes.get_by_right(&opcode) {
+                    disassemble_j(instruction, j_instruction)
+                } else if let Some(i_instruction) = i_codes.get_by_right(&opcode) {
+                    disassemble_i(instruction, &registers, *i_instruction)
+                } else {
+                    panic!("Invalid opcode");
+                }
+            };
+
+            println!("{}", result);
+        }
     }
 }
 
@@ -90,23 +148,37 @@ fn assemble_line(j_codes: &BiMap<&str, u32>, i_codes: &BiMap<&str, u32>, r_codes
 }
 
 fn assemble_i(opcode: u32, registers: &BiMap<&str, u32>, parts: Vec<&str>) -> u32 {
+    let immediate: u32;
+    let t_register: &u32;
+    let s_register: &u32;
+
     if opcode == LW_OPCODE || opcode == SW_OPCODE {
         let last_part_parts: Vec<&str> = parts[2]
             .split(|c| c == '(' || c == ')')
             .filter(|str| !str.is_empty())
             .collect();
 
-        let t_register = registers.get_by_left(parts[1]).unwrap();
-        let immediate = last_part_parts[0].parse::<u32>().expect("Invalid immediate value for lw/sw instruction") & 0xffff;
-        let s_register = registers.get_by_left(last_part_parts[1]).unwrap();
-
-        immediate | (s_register << 16) | (t_register << 21) | (opcode << 26)
+        t_register = registers.get_by_left(parts[1]).unwrap();
+        immediate = last_part_parts[0].parse::<u32>().expect("Invalid immediate value for lw/sw instruction") & 0xffff;
+        s_register = registers.get_by_left(last_part_parts[1]).unwrap();
     } else {
-        let immediate = parts[3].parse::<u32>().expect("Invalid immediate value for instruction") & 0xffff;
-        let t_register = registers.get_by_left(parts[1]).unwrap();
-        let s_register = registers.get_by_left(parts[2]).unwrap();
+        immediate = parts[3].parse::<u32>().expect("Invalid immediate value for instruction") & 0xffff;
+        t_register = registers.get_by_left(parts[1]).unwrap();
+        s_register = registers.get_by_left(parts[2]).unwrap();
+    }
 
-        immediate | (s_register << 16) | (t_register << 21) | (opcode << 26)
+    immediate | (s_register << 16) | (t_register << 21) | (opcode << 26)
+}
+
+fn disassemble_i(instruction: u32, registers: &BiMap<&str, u32>, instruction_name: &str) -> String {
+    let t_register = registers.get_by_right(&((instruction >> 21) & 0b11111)).unwrap();
+    let s_register = registers.get_by_right(&((instruction >> 16) & 0b11111)).unwrap();
+    let immediate = instruction & 0xffff;
+
+    if instruction_name.eq("lw") || instruction_name.eq("sw") {
+        format!("{} {}, {}({})\n", instruction_name, t_register, immediate, s_register)
+    } else {
+        format!("{} {}, {}, {}\n", instruction_name, t_register, s_register, immediate)
     }
 }
 
@@ -125,9 +197,22 @@ fn assemble_r(func_code: u32, registers: &BiMap<&str, u32>, parts: Vec<&str>) ->
     func_code | (shift_amount << 6) | (d_register << 11) | (t_register << 16) | (s_register << 21)
 }
 
+fn disassemble_r(instruction: u32, registers: &BiMap<&str, u32>, instruction_name: &str) -> String {
+    let d_register = registers.get_by_right(&((instruction >> 11) & 0b11111)).unwrap();
+    let t_register = registers.get_by_right(&((instruction >> 16) & 0b11111)).unwrap();
+    let s_register = registers.get_by_right(&((instruction >> 21) & 0b11111)).unwrap();
+
+    format!("{} {}, {}, {}", instruction_name, d_register, s_register, t_register)
+}
+
 // Not sure how to handle labels. It wasn't in the assembler Dabish gave us.
 fn assemble_j(opcode: u32) -> u32 {
     opcode << 26
+}
+
+fn disassemble_j(instruction: u32, instruction_name: &&str) -> String {
+    // Sorry. Dabish didn't include labels in his assembler, so we had nothing to go off of
+    format!("{} unimplemented", instruction_name)
 }
 
 // https://www.d.umn.edu/~gshute/mips/jtype.html
@@ -177,72 +262,40 @@ fn create_r_codes<'a>() -> BiMap<&'a str, u32> {
     ])
 }
 
-// All registers and their aliases (ex. $0 and $zero both map to 00000)
+// All registers (couldn't do aliases with BiMap, but if i used two maps it would complicate the code)
 fn create_register_codes<'a>() -> BiMap<&'a str, u32> {
     BiMap::from_iter([
-        ("$0", 0b00000),
         ("$zero", 0b00000),
-        ("$1", 0b00001),
         ("$at", 0b00001),
-        ("$2", 0b00010),
         ("$v0", 0b00010),
-        ("$3", 0b00011),
         ("$v1", 0b00011),
-        ("$4", 0b00100),
         ("$a0", 0b00100),
-        ("$5", 0b00101),
         ("$a1", 0b00101),
-        ("$6", 0b00110),
         ("$a2", 0b00110),
-        ("$7", 0b00111),
         ("$a3", 0b00111),
-        ("$8", 0b01000),
         ("$t0", 0b01000),
-        ("$9", 0b01001),
         ("$t1", 0b01001),
-        ("$10", 0b01010),
         ("$t2", 0b01010),
-        ("$11", 0b01011),
         ("$t3", 0b01011),
-        ("$12", 0b01100),
         ("$t4", 0b01100),
-        ("$13", 0b01101),
         ("$t5", 0b01101),
-        ("$14", 0b01110),
         ("$t6", 0b01110),
-        ("$15", 0b01111),
         ("$t7", 0b01111),
-        ("$16", 0b10000),
         ("$s0", 0b10000),
-        ("$17", 0b10001),
         ("$s1", 0b10001),
-        ("$18", 0b10010),
         ("$s2", 0b10010),
-        ("$19", 0b10011),
         ("$s3", 0b10011),
-        ("$20", 0b10100),
         ("$s4", 0b10100),
-        ("$21", 0b10101),
         ("$s5", 0b10101),
-        ("$22", 0b10110),
         ("$s6", 0b10110),
-        ("$23", 0b10111),
         ("$s7", 0b10111),
-        ("$24", 0b11000),
         ("$t8", 0b11000),
-        ("$25", 0b11001),
         ("$t9", 0b11001),
-        ("$26", 0b11010),
         ("$k0", 0b11010),
-        ("$27", 0b11011),
         ("$k1", 0b11011),
-        ("$28", 0b11100),
         ("$gp", 0b11100),
-        ("$29", 0b11101),
         ("$sp", 0b11101),
-        ("$30", 0b11110),
         ("$fp", 0b11110),
-        ("$31", 0b11111),
         ("$ra", 0b11111),
     ])
 }
